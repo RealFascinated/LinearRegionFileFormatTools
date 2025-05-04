@@ -41,7 +41,7 @@ COMPRESSION_TYPE = b'\x02'
 COMPRESSION_TYPE_ZLIB = 2
 EXTERNAL_FILE_COMPRESSION_TYPE = 128 + 2
 LINEAR_SIGNATURE = 0xc3ff13183cca9d9a
-SUPPORTED_VERSION = [1, 2]
+SUPPORTED_VERSION = [1, 2, 3]
 LINEAR_VERSION = 1
 
 # TODO: Alert users if the file name isn't r.0.0.linear
@@ -62,40 +62,125 @@ def open_region_linear(file_path):
     if version not in SUPPORTED_VERSION:
         raise Exception("Version invalid")
 
-    signature = struct.unpack(">Q", raw_region[-8:])[0]
+    if version == 3:
+        # Parse version 3 format
+        grid_size = raw_region[17]  # Get grid size from byte after version
+        if grid_size not in [1, 2, 4, 8, 16, 32]:
+            raise Exception("Invalid grid size")
+        bucket_size = 32 // grid_size
+        
+        # Skip region coordinates
+        pos = 18 + 8  # Skip region_x and region_z (4 bytes each)
+        
+        # Read chunk existence bitmap
+        chunk_exists = []
+        for i in range(128):  # 1024 chunks / 8 bits per byte
+            byte = raw_region[pos + i]
+            for j in range(8):
+                chunk_exists.append((byte >> (7 - j)) & 1 == 1)
+        pos += 128
+        
+        # Skip NBT features
+        while True:
+            feature_name_length = raw_region[pos]
+            pos += 1
+            if feature_name_length == 0:
+                break
+            pos += feature_name_length + 4  # Skip feature name and value
+        
+        # Read bucket information
+        bucket_sizes = []
+        bucket_compression_levels = []
+        bucket_hashes = []
+        for i in range(grid_size * grid_size):
+            bucket_sizes.append(struct.unpack_from(">I", raw_region, pos)[0])
+            pos += 4
+            bucket_compression_levels.append(raw_region[pos])
+            pos += 1
+            bucket_hashes.append(struct.unpack_from(">Q", raw_region, pos)[0])
+            pos += 8
+        
+        # Read bucket data
+        bucket_data = []
+        for i in range(grid_size * grid_size):
+            if bucket_sizes[i] > 0:
+                bucket_data.append(raw_region[pos:pos + bucket_sizes[i]])
+                pos += bucket_sizes[i]
+            else:
+                bucket_data.append(None)
+        
+        # Verify footer signature
+        footer_signature = struct.unpack_from(">Q", raw_region, -8)[0]
+        if footer_signature != LINEAR_SIGNATURE:
+            raise Exception("Footer signature invalid")
+        
+        # Process buckets and extract chunks
+        chunks = [None] * REGION_DIMENSION * REGION_DIMENSION
+        timestamps = [0] * REGION_DIMENSION * REGION_DIMENSION
+        
+        for bucket_idx, bucket in enumerate(bucket_data):
+            if bucket is None:
+                continue
+                
+            bx = bucket_idx // grid_size
+            bz = bucket_idx % grid_size
+            
+            # Decompress bucket
+            decompressed = pyzstd.decompress(bucket)
+            bucket_buffer = bytearray(decompressed)
+            pos = 0
+            
+            for cx in range(bucket_size):
+                for cz in range(bucket_size):
+                    chunk_idx = (bx * bucket_size + cx) + (bz * bucket_size + cz) * 32
+                    chunk_size = struct.unpack_from(">I", bucket_buffer, pos)[0]
+                    pos += 4
+                    timestamp = struct.unpack_from(">Q", bucket_buffer, pos)[0]
+                    pos += 8
+                    timestamps[chunk_idx] = timestamp
+                    
+                    if chunk_size > 0:
+                        chunk_data = bytes(bucket_buffer[pos:pos + chunk_size - 8])
+                        pos += chunk_size - 8
+                        chunks[chunk_idx] = Chunk(chunk_data, REGION_DIMENSION * region_x + chunk_idx % 32, REGION_DIMENSION * region_z + chunk_idx // 32)
+        
+        return Region(chunks, region_x, region_z, mtime, timestamps)
+    else:
+        # Original version 1/2 handling
+        signature = struct.unpack(">Q", raw_region[-8:])[0]
 
-    if signature != LINEAR_SIGNATURE:
-        raise Exception("Footer signature invalid")
+        if signature != LINEAR_SIGNATURE:
+            raise Exception("Footer signature invalid")
 
-    decompressed_region = pyzstd.decompress(raw_region[32:-8])
+        decompressed_region = pyzstd.decompress(raw_region[32:-8])
 
-    sizes = []
-    timestamps = []
+        sizes = []
+        timestamps = []
 
-    real_chunk_count = 0
-    total_size = 0
-    for i in range(REGION_DIMENSION * REGION_DIMENSION):
-        size, timestamp = struct.unpack_from(">II", decompressed_region, i * 8)
-        total_size += size
-        if size != 0: real_chunk_count += 1
-        sizes.append(size)
-        timestamps.append(timestamp)
+        real_chunk_count = 0
+        total_size = 0
+        for i in range(REGION_DIMENSION * REGION_DIMENSION):
+            size, timestamp = struct.unpack_from(">II", decompressed_region, i * 8)
+            total_size += size
+            if size != 0: real_chunk_count += 1
+            sizes.append(size)
+            timestamps.append(timestamp)
 
-    if total_size + HEADER_SIZE != len(decompressed_region):
-        raise Exception("Decompressed size invalid")
+        if total_size + HEADER_SIZE != len(decompressed_region):
+            raise Exception("Decompressed size invalid")
 
-    if real_chunk_count != chunk_count:
-        raise Exception("Chunk count invalid")
+        if real_chunk_count != chunk_count:
+            raise Exception("Chunk count invalid")
 
-    chunks = [None] * REGION_DIMENSION * REGION_DIMENSION
+        chunks = [None] * REGION_DIMENSION * REGION_DIMENSION
 
-    iterator = HEADER_SIZE
-    for i in range(REGION_DIMENSION * REGION_DIMENSION):
-        if sizes[i] > 0:
-            chunks[i] = Chunk(decompressed_region[iterator: iterator + sizes[i]], REGION_DIMENSION * region_x + i % 32, REGION_DIMENSION * region_z + i // 32)
-        iterator += sizes[i]
+        iterator = HEADER_SIZE
+        for i in range(REGION_DIMENSION * REGION_DIMENSION):
+            if sizes[i] > 0:
+                chunks[i] = Chunk(decompressed_region[iterator: iterator + sizes[i]], REGION_DIMENSION * region_x + i % 32, REGION_DIMENSION * region_z + i // 32)
+            iterator += sizes[i]
 
-    return Region(chunks, region_x, region_z, mtime, timestamps)
+        return Region(chunks, region_x, region_z, mtime, timestamps)
 
 def quickly_verify_linear(file_path):
     try:
