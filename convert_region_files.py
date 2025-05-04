@@ -9,6 +9,7 @@ from glob import glob
 from linear import open_region_linear, write_region_anvil, open_region_anvil, write_region_linear
 from multiprocessing import Pool, cpu_count, Manager
 from tqdm import tqdm
+import struct
 
 class CustomArgumentParser(argparse.ArgumentParser):
     def error(self, _):
@@ -50,10 +51,19 @@ def convert_file(args):
         if log:
             print(source_file, "converted, compression %3d%%" % (100 * destination_size / source_size))
         converted_counter.value += 1
-    except Exception:
+    except Exception as e:
         import traceback
         traceback.print_exc()
+        if "Version invalid" in str(e):
+            try:
+                with open(source_file, 'rb') as f:
+                    raw_region = f.read()
+                    _, version, _, _, _, _, _ = struct.unpack_from(">QBQbhIQ", raw_region, 0)
+                    print(f"Found version {version} in file {source_file}")
+            except:
+                print("Could not read version from file")
         print("Error with region file", source_file)
+        sys.exit(1)  # Exit after first error
 
 if __name__ == "__main__":
     parser = CustomArgumentParser(description="Convert region files between Anvil and Linear format")
